@@ -1,285 +1,292 @@
 
 import os
 import sqlite3
+from pathlib import Path
+from datetime import datetime, timezone
+
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, MessageHandler,
-    ContextTypes, filters, ConversationHandler
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN", "").strip()
-ADMIN_ID = int(os.getenv("ADMIN_ID", "509506756"))
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "playlist").strip().lstrip("@")
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Put your BotFather token in .env")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "playlistmusic.db")
 
-DB = "playlist.db"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing. Add it to Railway Variables.")
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
 
 def db():
-    con = sqlite3.connect(DB)
+    con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
     return con
 
 def init_db():
     con = db()
-    con.execute("""CREATE TABLE IF NOT EXISTS tracks (
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT,
+        language TEXT DEFAULT 'fa',
+        notifications_enabled INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS artists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        normalized_name TEXT NOT NULL UNIQUE,
+        bio TEXT,
+        image_file_id TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS albums (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        artist_id INTEGER,
+        title TEXT NOT NULL,
+        normalized_title TEXT NOT NULL,
+        year INTEGER,
+        cover_file_id TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL,
+        UNIQUE(artist_id, normalized_title)
+    );
+
+    CREATE TABLE IF NOT EXISTS tracks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        telegram_file_id TEXT,
+        telegram_file_unique_id TEXT,
+        file_hash TEXT,
+        title TEXT NOT NULL,
+        normalized_title TEXT NOT NULL,
+        artist_id INTEGER,
+        album_id INTEGER,
+        duration INTEGER,
+        language TEXT,
+        genre TEXT,
+        mood TEXT,
+        year INTEGER,
+        version TEXT DEFAULT 'Original',
+        status TEXT DEFAULT 'approved',
+        source_chat_id INTEGER,
+        source_message_id INTEGER,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE SET NULL,
+        FOREIGN KEY (album_id) REFERENCES albums(id) ON DELETE SET NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tracks_title ON tracks(normalized_title);
+    CREATE INDEX IF NOT EXISTS idx_tracks_artist ON tracks(artist_id);
+    CREATE INDEX IF NOT EXISTS idx_tracks_hash ON tracks(file_hash);
+
+    CREATE TABLE IF NOT EXISTS follows (
+        user_id INTEGER NOT NULL,
+        artist_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(user_id, artist_id),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(artist_id) REFERENCES artists(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS likes (
+        user_id INTEGER NOT NULL,
+        track_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(user_id, track_id),
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS playlists (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS playlist_tracks (
+        playlist_id INTEGER NOT NULL,
+        track_id INTEGER NOT NULL,
+        position INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(playlist_id, track_id),
+        FOREIGN KEY(playlist_id) REFERENCES playlists(id) ON DELETE CASCADE,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        track_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        query TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS notifications (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        artist_id INTEGER,
+        track_id INTEGER,
+        kind TEXT NOT NULL,
+        sent_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY(artist_id) REFERENCES artists(id) ON DELETE SET NULL,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        track_id INTEGER,
+        reason TEXT NOT NULL,
+        status TEXT DEFAULT 'open',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL,
+        FOREIGN KEY(track_id) REFERENCES tracks(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS required_channels (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL UNIQUE,
+        title TEXT NOT NULL,
+        invite_url TEXT,
+        active INTEGER DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS ads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT NOT NULL,
-        artist TEXT NOT NULL,
-        mood TEXT NOT NULL,
-        file_id TEXT NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
-    con.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )""")
+        body TEXT NOT NULL,
+        button_text TEXT,
+        button_url TEXT,
+        placement TEXT DEFAULT 'home',
+        frequency INTEGER DEFAULT 0,
+        starts_at TEXT,
+        ends_at TEXT,
+        active INTEGER DEFAULT 0,
+        impressions INTEGER DEFAULT 0,
+        clicks INTEGER DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS admin_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT,
+        created_at TEXT NOT NULL
+    );
+
+    INSERT OR IGNORE INTO schema_meta(key,value)
+    VALUES ('schema_version','1');
+
+    """)
     con.commit()
     con.close()
 
-def add_user(user_id):
+def normalize(s: str) -> str:
+    return " ".join((s or "").strip().lower().replace("ي","ی").replace("ك","ک").split())
+
+def upsert_user(tg_user):
     con = db()
-    con.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
+    con.execute("""
+        INSERT INTO users(id, username, first_name, last_name, created_at, last_seen_at)
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(id) DO UPDATE SET
+          username=excluded.username,
+          first_name=excluded.first_name,
+          last_name=excluded.last_name,
+          last_seen_at=excluded.last_seen_at
+    """, (
+        tg_user.id, tg_user.username, tg_user.first_name, tg_user.last_name,
+        now(), now()
+    ))
     con.commit()
     con.close()
-
-def moods():
-    return [
-        ("🌙 Night", "night"),
-        ("🚗 Night Drive", "night_drive"),
-        ("☔ Rainy Day", "rainy_day"),
-        ("🖤 Sad", "sad"),
-        ("❤️ Love", "love"),
-        ("🔥 Energy", "energy"),
-        ("☀️ Morning", "morning"),
-        ("🌃 Late Night", "late_night"),
-        ("✈️ Travel", "travel"),
-        ("💿 Old But Gold", "old_gold"),
-    ]
-
-def main_menu():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎵 آهنگ‌ها", callback_data="songs"),
-         InlineKeyboardButton("🎧 پلی‌لیست‌ها", callback_data="playlists")],
-        [InlineKeyboardButton("🔥 آهنگ‌های جدید", callback_data="new"),
-         InlineKeyboardButton("🔎 جستجو", callback_data="search")],
-        [InlineKeyboardButton("🌙 Mood", callback_data="moods")],
-        [InlineKeyboardButton("📢 کانال playlist", url=f"https://t.me/{CHANNEL_USERNAME}")]
-    ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    add_user(update.effective_user.id)
-    text = (
-        "🎧 <b>به playlist خوش اومدی</b>\n\n"
-        "اینجا برای هر حس، یه آهنگ داریم. 🖤\n\n"
-        "🎵 آهنگ‌ها\n"
-        "🎧 پلی‌لیست‌ها\n"
-        "🔥 آهنگ‌های جدید\n"
-        "🌙 موسیقی بر اساس حس\n\n"
-        "<i>Music for every mood.</i>"
-    )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=main_menu())
+    if update.effective_user:
+        upsert_user(update.effective_user)
 
-async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🎵 جستجوی آهنگ", callback_data="search_info")],
+        [InlineKeyboardButton("👤 خواننده‌ها", callback_data="artists_info"),
+         InlineKeyboardButton("❤️ علاقه‌مندی‌ها", callback_data="likes_info")],
+        [InlineKeyboardButton("📂 پلی‌لیست‌ها", callback_data="playlists_info"),
+         InlineKeyboardButton("⚙️ تنظیمات", callback_data="settings_info")],
+    ]
+    await update.message.reply_text(
+        "🎵 Playlist Music\n\n"
+        "پایه ۱ با موفقیت فعال است.\n"
+        "هسته دیتابیس، کاربران، خواننده‌ها، آلبوم‌ها، آهنگ‌ها، "
+        "لایک، فالو، پلی‌لیست، تاریخچه، اعلان و گزارش آماده شده است.\n\n"
+        "برای ورود به مرحله بعد، همین نسخه را تست می‌کنیم.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or update.effective_user.id != ADMIN_ID:
+        return
+    con = db()
+    stats = {}
+    for table in ["users","artists","albums","tracks","follows","likes","playlists","history","searches","notifications","reports"]:
+        stats[table] = con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+    con.close()
+    text = "📊 آمار پایه ۱\n\n" + "\n".join(f"• {k}: {v}" for k,v in stats.items())
+    await update.message.reply_text(text)
+
+async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    data = q.data
+    messages = {
+        "search_info": "🔎 جستجو در پایه بعدی به آرشیو واقعی آهنگ‌ها وصل می‌شود.",
+        "artists_info": "👤 بخش خواننده‌ها در مرحله UX کامل می‌شود.",
+        "likes_info": "❤️ ساختار لایک آماده است و در مرحله UX فعال می‌شود.",
+        "playlists_info": "📂 ساختار پلی‌لیست آماده است و در مرحله UX فعال می‌شود.",
+        "settings_info": "⚙️ تنظیمات کاربر در مرحله UX اضافه می‌شود.",
+    }
+    await q.message.reply_text(messages.get(q.data, "این بخش هنوز در حال توسعه است."))
 
-    if data == "home":
-        await q.edit_message_text(
-            "🎧 <b>playlist</b>\n\nبرای هر حس، یک آهنگ. 🖤",
-            parse_mode="HTML", reply_markup=main_menu()
-        )
-        return
-
-    if data == "moods":
-        rows = []
-        m = moods()
-        for i in range(0, len(m), 2):
-            rows.append([
-                InlineKeyboardButton(m[i][0], callback_data=f"mood:{m[i][1]}"),
-                InlineKeyboardButton(m[i+1][0], callback_data=f"mood:{m[i+1][1]}") if i+1 < len(m) else InlineKeyboardButton("🏠", callback_data="home")
-            ])
-        rows.append([InlineKeyboardButton("🏠 منوی اصلی", callback_data="home")])
-        await q.edit_message_text("🌙 <b>یک حس انتخاب کن:</b>", parse_mode="HTML",
-                                  reply_markup=InlineKeyboardMarkup(rows))
-        return
-
-    if data.startswith("mood:"):
-        mood = data.split(":",1)[1]
-        await send_tracks(update, context, mood=mood)
-        return
-
-    if data in ("songs", "new"):
-        await send_tracks(update, context, latest=(data=="new"))
-        return
-
-    if data == "playlists":
-        await q.edit_message_text(
-            "🎧 <b>Playlists</b>\n\n"
-            "در این بخش می‌تونی پلی‌لیست‌های کانال رو به ربات اضافه کنی.\n"
-            "فعلاً از بخش Mood آهنگ‌ها رو انتخاب کن.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌙 Mood", callback_data="moods"),
-                                                InlineKeyboardButton("🏠 خانه", callback_data="home")]])
-        )
-        return
-
-    if data == "search":
-        await q.edit_message_text(
-            "🔎 برای جستجو، از دستور زیر استفاده کن:\n\n"
-            "<code>/search نام آهنگ یا خواننده</code>",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 خانه", callback_data="home")]])
-        )
-        return
-
-async def send_tracks(update, context, mood=None, latest=False):
-    con = db()
-    if mood:
-        rows = con.execute(
-            "SELECT * FROM tracks WHERE mood=? ORDER BY id DESC LIMIT 10", (mood,)
-        ).fetchall()
-    else:
-        rows = con.execute(
-            "SELECT * FROM tracks ORDER BY id DESC LIMIT 10"
-        ).fetchall()
-    con.close()
-
-    if not rows:
-        text = "🎵 هنوز آهنگی در این بخش قرار نگرفته."
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 خانه", callback_data="home")]])
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, reply_markup=kb)
-        return
-
-    target = update.callback_query.message if update.callback_query else update.message
-    for r in rows:
-        await context.bot.send_audio(
-            chat_id=target.chat_id,
-            audio=r["file_id"],
-            caption=f"🎵 <b>{r['title']}</b>\n👤 {r['artist']}\n🌙 {r['mood']}",
-            parse_mode="HTML"
-        )
-    if update.callback_query:
-        await update.callback_query.message.reply_text(
-            "🏠", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("منوی اصلی", callback_data="home")]])
-        )
-
-async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    add_user(update.effective_user.id)
-    query = " ".join(context.args).strip()
-    if not query:
-        await update.message.reply_text("مثال:\n/search The Weeknd")
-        return
-    con = db()
-    rows = con.execute(
-        "SELECT * FROM tracks WHERE title LIKE ? OR artist LIKE ? ORDER BY id DESC LIMIT 10",
-        (f"%{query}%", f"%{query}%")
-    ).fetchall()
-    con.close()
-    if not rows:
-        await update.message.reply_text("🔎 چیزی پیدا نشد.")
-        return
-    for r in rows:
-        await context.bot.send_audio(
-            update.effective_chat.id, r["file_id"],
-            caption=f"🎵 <b>{r['title']}</b>\n👤 {r['artist']}\n🌙 {r['mood']}",
-            parse_mode="HTML"
-        )
-
-# ---- Admin add flow ----
-TITLE, ARTIST, MOOD, FILE = range(4)
-
-def admin_only(update):
-    return update.effective_user and update.effective_user.id == ADMIN_ID
-
-async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not admin_only(update):
-        await update.message.reply_text("⛔ این بخش فقط برای ادمین است.")
-        return ConversationHandler.END
-    await update.message.reply_text("🎵 نام آهنگ را بفرست:")
-    return TITLE
-
-async def add_title(update, context):
-    context.user_data["title"] = update.message.text.strip()
-    await update.message.reply_text("👤 نام خواننده را بفرست:")
-    return ARTIST
-
-async def add_artist(update, context):
-    context.user_data["artist"] = update.message.text.strip()
-    await update.message.reply_text(
-        "🌙 دسته‌بندی را بفرست.\nمثال: night / love / sad / energy"
-    )
-    return MOOD
-
-async def add_mood(update, context):
-    context.user_data["mood"] = update.message.text.strip().lower()
-    await update.message.reply_text("🎧 حالا فایل آهنگ را به‌صورت Audio بفرست:")
-    return FILE
-
-async def add_file(update, context):
-    if not update.message.audio:
-        await update.message.reply_text("لطفاً خود فایل آهنگ را به‌صورت Audio ارسال کن.")
-        return FILE
-    a = update.message.audio
-    con = db()
-    con.execute(
-        "INSERT INTO tracks(title,artist,mood,file_id) VALUES(?,?,?,?)",
-        (context.user_data["title"], context.user_data["artist"],
-         context.user_data["mood"], a.file_id)
-    )
-    con.commit()
-    con.close()
-    await update.message.reply_text(
-        f"✅ اضافه شد!\n\n🎵 {context.user_data['title']}\n👤 {context.user_data['artist']}\n🌙 {context.user_data['mood']}"
-    )
-    context.user_data.clear()
-    return ConversationHandler.END
-
-async def cancel(update, context):
-    context.user_data.clear()
-    await update.message.reply_text("لغو شد.")
-    return ConversationHandler.END
-
-async def admin(update, context):
-    if not admin_only(update):
-        await update.message.reply_text("⛔ دسترسی ندارید.")
-        return
-    con=db()
-    count=con.execute("SELECT COUNT(*) c FROM tracks").fetchone()["c"]
-    users=con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
-    con.close()
-    await update.message.reply_text(
-        f"👑 <b>Admin Panel</b>\n\n🎵 آهنگ‌ها: {count}\n👥 کاربران: {users}\n\n"
-        "/add — افزودن آهنگ\n/search — جستجو",
-        parse_mode="HTML"
-    )
+async def post_init(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("start", "شروع"),
+        BotCommand("admin", "پنل مدیریت"),
+    ])
 
 def main():
     init_db()
-    app=Application.builder().token(TOKEN).build()
-
-    conv=ConversationHandler(
-        entry_points=[CommandHandler("add", add_start)],
-        states={
-            TITLE:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_title)],
-            ARTIST:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_artist)],
-            MOOD:[MessageHandler(filters.TEXT & ~filters.COMMAND, add_mood)],
-            FILE:[MessageHandler(filters.AUDIO, add_file)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("search", search))
     app.add_handler(CommandHandler("admin", admin))
-    app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(menu_callback))
-    print("playlist bot is running...")
-    app.run_polling()
+    app.add_handler(CallbackQueryHandler(callback))
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
